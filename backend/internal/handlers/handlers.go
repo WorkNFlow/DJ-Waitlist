@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"dj-app-backend/internal/cleaner"
 	"dj-app-backend/internal/db"
 	"dj-app-backend/internal/models"
 	"dj-app-backend/internal/ws"
@@ -30,8 +31,10 @@ type Store interface {
 }
 
 type Handler struct {
-	store Store
-	hub   *ws.Hub
+	store   Store
+	hub     *ws.Hub
+	cleaner *cleaner.Cleaner
+	roomTTL time.Duration
 }
 
 func NewHandler(store Store, hub *ws.Hub) *Handler {
@@ -39,6 +42,23 @@ func NewHandler(store Store, hub *ws.Hub) *Handler {
 		store: store,
 		hub:   hub,
 	}
+}
+
+// SetRoomLifecycle configures optional lazy cleanup and room TTL validation.
+func (h *Handler) SetRoomLifecycle(c *cleaner.Cleaner, ttl time.Duration) {
+	h.cleaner = c
+	h.roomTTL = ttl
+}
+
+func (h *Handler) getActiveRoomByCode(ctx context.Context, code string) (*models.Room, error) {
+	room, err := h.store.GetRoomByCode(ctx, code)
+	if err != nil {
+		return nil, err
+	}
+	if h.roomTTL > 0 && time.Since(room.CreatedAt) > h.roomTTL {
+		return nil, db.ErrNotFound
+	}
+	return room, nil
 }
 
 // writeJSON writes a standard JSON response.
@@ -67,6 +87,11 @@ func generateRoomCode() (string, error) {
 
 // CreateRoom handles POST /api/rooms
 func (h *Handler) CreateRoom(w http.ResponseWriter, r *http.Request) {
+	if h.cleaner != nil {
+		// Lazily clean expired rooms (throttled) before allocating a new 4-digit code
+		_, _ = h.cleaner.MaybeClean(r.Context())
+	}
+
 	var room *models.Room
 	var err error
 
@@ -102,7 +127,7 @@ func (h *Handler) GetRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	room, err := h.store.GetRoomByCode(r.Context(), code)
+	room, err := h.getActiveRoomByCode(r.Context(), code)
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "Room not found")
@@ -134,7 +159,7 @@ func (h *Handler) CreateRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	room, err := h.store.GetRoomByCode(r.Context(), code)
+	room, err := h.getActiveRoomByCode(r.Context(), code)
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "Room not found")
@@ -197,7 +222,7 @@ func (h *Handler) UpdateRequestStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	room, err := h.store.GetRoomByCode(r.Context(), code)
+	room, err := h.getActiveRoomByCode(r.Context(), code)
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "Room not found")
@@ -249,7 +274,7 @@ func (h *Handler) ServeWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify room exists before upgrading
-	_, err := h.store.GetRoomByCode(r.Context(), code)
+	_, err := h.getActiveRoomByCode(r.Context(), code)
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "Room not found")

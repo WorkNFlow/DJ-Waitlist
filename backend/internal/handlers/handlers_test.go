@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"dj-app-backend/internal/cleaner"
 	"dj-app-backend/internal/db"
 	"dj-app-backend/internal/handlers"
 	"dj-app-backend/internal/models"
@@ -214,4 +215,53 @@ func TestUpdateRequestStatus(t *testing.T) {
 		t.Errorf("expected 400 for invalid status, got %d", recBad.Code)
 	}
 	_ = created
+}
+
+func (m *mockStore) CleanExpiredRooms(ctx context.Context, maxAge time.Duration) (int64, error) {
+	var deleted int64
+	for code, room := range m.rooms {
+		if time.Since(room.CreatedAt) > maxAge {
+			delete(m.rooms, code)
+			deleted++
+		}
+	}
+	return deleted, nil
+}
+
+func TestRoomExpirationAndLazyCleanup(t *testing.T) {
+	store := newMockStore()
+	hub := ws.NewHub()
+	h := handlers.NewHandler(store, hub)
+
+	ttl := 24 * time.Hour
+	c := cleaner.New(store, 15*time.Minute, ttl)
+	h.SetRoomLifecycle(c, ttl)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/rooms", h.CreateRoom)
+	mux.HandleFunc("GET /api/rooms/{code}", h.GetRoom)
+
+	// Insert an expired room (25 hours old)
+	expiredRoom, _ := store.CreateRoom(context.Background(), "9999")
+	expiredRoom.CreatedAt = time.Now().Add(-25 * time.Hour)
+
+	// GET expired room should immediately return 404
+	reqGet := httptest.NewRequest("GET", "/api/rooms/9999", nil)
+	recGet := httptest.NewRecorder()
+	mux.ServeHTTP(recGet, reqGet)
+	if recGet.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for expired room, got %d", recGet.Code)
+	}
+
+	// POST /api/rooms should lazily delete the expired room from the store
+	reqCreate := httptest.NewRequest("POST", "/api/rooms", nil)
+	recCreate := httptest.NewRecorder()
+	mux.ServeHTTP(recCreate, reqCreate)
+	if recCreate.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", recCreate.Code)
+	}
+
+	if _, exists := store.rooms["9999"]; exists {
+		t.Errorf("expected expired room 9999 to be lazily cleaned up on CreateRoom")
+	}
 }

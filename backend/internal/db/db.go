@@ -72,6 +72,7 @@ func InitSchema(ctx context.Context, pool *pgxpool.Pool) error {
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_rooms_code ON rooms(code);
+	CREATE INDEX IF NOT EXISTS idx_rooms_created_at ON rooms(created_at);
 	CREATE INDEX IF NOT EXISTS idx_song_requests_room_id ON song_requests(room_id);
 	`
 
@@ -185,4 +186,20 @@ func (s *Store) UpdateRequestStatus(ctx context.Context, roomID int, requestID i
 	}
 
 	return &req, nil
+}
+
+// CleanExpiredRooms deletes rooms created before (now - maxAge).
+// Cascading foreign keys will automatically remove associated song requests.
+func (s *Store) CleanExpiredRooms(ctx context.Context, maxAge time.Duration) (int64, error) {
+	cutoff := time.Now().Add(-maxAge)
+	query := `
+		DELETE FROM rooms
+		WHERE created_at < $1;
+	`
+	tag, err := s.pool.Exec(ctx, query, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("failed to clean expired rooms: %w", err)
+	}
+
+	return tag.RowsAffected(), nil
 }

@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"dj-app-backend/internal/cleaner"
 	"dj-app-backend/internal/db"
 	"dj-app-backend/internal/handlers"
 	"dj-app-backend/internal/middleware"
@@ -59,6 +60,25 @@ func main() {
 	store := db.NewStore(pool)
 	hub := ws.NewHub()
 	h := handlers.NewHandler(store, hub)
+
+	// Room TTL and lazy on-demand cleaner setup
+	roomTTL := 24 * time.Hour
+	if ttlStr := os.Getenv("ROOM_TTL"); ttlStr != "" {
+		if parsedTTL, err := time.ParseDuration(ttlStr); err == nil && parsedTTL > 0 {
+			roomTTL = parsedTTL
+		}
+	}
+
+	cleanupInterval := 15 * time.Minute
+	if intervalStr := os.Getenv("ROOM_CLEANUP_INTERVAL"); intervalStr != "" {
+		if parsedInterval, err := time.ParseDuration(intervalStr); err == nil && parsedInterval > 0 {
+			cleanupInterval = parsedInterval
+		}
+	}
+
+	cleanerWorker := cleaner.New(store, cleanupInterval, roomTTL)
+	h.SetRoomLifecycle(cleanerWorker, roomTTL)
+	log.Printf("[INIT] Lazy room cleanup configured (ttl=%v, throttle=%v)", roomTTL, cleanupInterval)
 
 	// Router setup (Go 1.22+ standard net/http mux)
 	mux := http.NewServeMux()
