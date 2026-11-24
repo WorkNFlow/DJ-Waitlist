@@ -11,10 +11,13 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"dj-app-backend/internal/db"
 	"dj-app-backend/internal/models"
 	"dj-app-backend/internal/ws"
+
+	"github.com/gorilla/websocket"
 )
 
 // Store defines the database storage interface needed by handlers.
@@ -266,11 +269,38 @@ func (h *Handler) ServeWS(w http.ResponseWriter, r *http.Request) {
 	h.hub.Register(code, conn)
 	defer h.hub.Unregister(code, conn)
 
-	// Keep connection open and read incoming frames (e.g. ping/pong, close messages)
+	// Set initial read deadline and handle pong responses
+	conn.SetReadLimit(4096)
+	_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	conn.SetPongHandler(func(string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
+	// Periodic ping ticker to keep WebSocket connections open through proxies
+	ticker := time.NewTicker(25 * time.Second)
+	defer ticker.Stop()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			_, _, readErr := conn.ReadMessage()
+			if readErr != nil {
+				break
+			}
+		}
+	}()
+
 	for {
-		_, _, readErr := conn.ReadMessage()
-		if readErr != nil {
-			break
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
 		}
 	}
 }

@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { getRoom, sendSongRequest } from '../api/client';
-import type { Room, SongRequest } from '../types';
+import { getRoom, sendSongRequest, getWebSocketUrl } from '../api/client';
+import type { Room, SongRequest, WSMessage } from '../types';
 import {
   Send,
   Music,
@@ -21,10 +21,10 @@ const LOCAL_STORAGE_MY_REQUESTS_KEY = 'dj_my_requests';
 
 // Быстрые теги / настроения для заказа
 const VIBE_SUGGESTIONS = [
-  { label: 'Танцевальный хит', icon: Flame, tag: '[Хит] ' },
-  { label: 'Медляк', icon: Heart, tag: '[Медляк] ' },
-  { label: 'Поздравление', icon: Sparkles, tag: '[Поздравление] ' },
-  { label: 'Драйв', icon: Zap, tag: '[Драйв] ' },
+  { id: 'hit', label: 'Танцевальный хит', icon: Flame, tag: '[Хит]' },
+  { id: 'slow', label: 'Медляк', icon: Heart, tag: '[Медляк]' },
+  { id: 'greet', label: 'Поздравление', icon: Sparkles, tag: '[Поздравление]' },
+  { id: 'drive', label: 'Драйв', icon: Zap, tag: '[Драйв]' },
 ];
 
 export const GuestRoomPage: React.FC = () => {
@@ -35,6 +35,7 @@ export const GuestRoomPage: React.FC = () => {
   const [roomError, setRoomError] = useState<string | null>(!code ? 'Код комнаты не указан' : null);
 
   const [songText, setSongText] = useState('');
+  const [selectedVibeTag, setSelectedVibeTag] = useState<string | null>(null);
   const [guestName, setGuestName] = useState(() => {
     return localStorage.getItem(LOCAL_STORAGE_GUEST_NAME_KEY) || '';
   });
@@ -53,6 +54,7 @@ export const GuestRoomPage: React.FC = () => {
     }
   });
 
+  // Загрузка комнаты и синхронизация актуальных статусов
   useEffect(() => {
     if (!code) return;
 
@@ -62,6 +64,25 @@ export const GuestRoomPage: React.FC = () => {
         if (isMounted) {
           setRoom(data.room);
           setLoadingRoom(false);
+
+          // Обновляем статусы уже отправленных треков из базы данных
+          if (data.requests && data.requests.length > 0) {
+            setMySentRequests((prev) => {
+              const updated = prev.map((localReq) => {
+                const found = data.requests.find((r) => r.id === localReq.id);
+                return found ? found : localReq;
+              });
+              try {
+                localStorage.setItem(
+                  `${LOCAL_STORAGE_MY_REQUESTS_KEY}_${code}`,
+                  JSON.stringify(updated.slice(0, 20)),
+                );
+              } catch {
+                // Ignore storage quota
+              }
+              return updated;
+            });
+          }
         }
       })
       .catch(() => {
@@ -73,6 +94,63 @@ export const GuestRoomPage: React.FC = () => {
 
     return () => {
       isMounted = false;
+    };
+  }, [code]);
+
+  // WebSocket соединение для получения обновления статусов треков в реальном времени
+  useEffect(() => {
+    if (!code) return;
+    let isUnmounted = false;
+    let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+    let ws: WebSocket | null = null;
+
+    const connect = () => {
+      if (isUnmounted) return;
+      const wsUrl = getWebSocketUrl(code);
+      ws = new WebSocket(wsUrl);
+
+      ws.onmessage = (event) => {
+        if (isUnmounted) return;
+        try {
+          const data: WSMessage = JSON.parse(event.data);
+          if (data.type === 'status_updated' && data.payload) {
+            const updated = data.payload;
+            setMySentRequests((prev) => {
+              const hasMatch = prev.some((r) => r.id === updated.id);
+              if (!hasMatch) return prev;
+              const newList = prev.map((r) => (r.id === updated.id ? updated : r));
+              try {
+                localStorage.setItem(
+                  `${LOCAL_STORAGE_MY_REQUESTS_KEY}_${code}`,
+                  JSON.stringify(newList.slice(0, 20)),
+                );
+              } catch {
+                // Ignore storage quota
+              }
+              return newList;
+            });
+          }
+        } catch {
+          // Игнорируем поврежденные сообщения
+        }
+      };
+
+      ws.onclose = () => {
+        if (isUnmounted) return;
+        reconnectTimeout = setTimeout(connect, 3000);
+      };
+
+      ws.onerror = () => {
+        // Ошибки сокетов переподключаются через onclose
+      };
+    };
+
+    connect();
+
+    return () => {
+      isUnmounted = true;
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      if (ws) ws.close();
     };
   }, [code]);
 
@@ -89,7 +167,12 @@ export const GuestRoomPage: React.FC = () => {
         localStorage.setItem(LOCAL_STORAGE_GUEST_NAME_KEY, guestName.trim());
       }
 
-      const newRequest = await sendSongRequest(code, songText, guestName);
+      // Если выбран акцент/вайб, аккуратно добавляем его перед названием трека
+      const fullSongText = selectedVibeTag
+        ? `${selectedVibeTag} ${songText.trim()}`
+        : songText.trim();
+
+      const newRequest = await sendSongRequest(code, fullSongText, guestName);
 
       const updatedList = [newRequest, ...mySentRequests];
       setMySentRequests(updatedList);
@@ -103,6 +186,7 @@ export const GuestRoomPage: React.FC = () => {
       }
 
       setSongText('');
+      setSelectedVibeTag(null);
       setSuccessMessage(true);
 
       setTimeout(() => {
@@ -116,10 +200,9 @@ export const GuestRoomPage: React.FC = () => {
     }
   };
 
+  // Одиночный выбор категории (повторный клик снимает выбор)
   const handleVibeTagClick = (tag: string) => {
-    if (!songText.includes(tag.trim())) {
-      setSongText((prev) => `${tag}${prev}`);
-    }
+    setSelectedVibeTag((prev) => (prev === tag ? null : tag));
   };
 
   if (loadingRoom) {
@@ -218,20 +301,38 @@ export const GuestRoomPage: React.FC = () => {
 
           {/* Быстрые теги настроения */}
           <div className="mb-4">
-            <div className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest mb-2 font-mono">
-              Быстрый акцент (опционально)
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest font-mono">
+                Быстрый акцент (выберите один)
+              </span>
+              {selectedVibeTag && (
+                <button
+                  type="button"
+                  onClick={() => setSelectedVibeTag(null)}
+                  className="text-[10px] text-zinc-500 hover:text-zinc-300 font-mono underline cursor-pointer"
+                >
+                  Сбросить
+                </button>
+              )}
             </div>
             <div className="flex flex-wrap gap-1.5">
               {VIBE_SUGGESTIONS.map((v) => {
                 const IconComponent = v.icon;
+                const isSelected = selectedVibeTag === v.tag;
                 return (
                   <button
                     key={v.label}
                     type="button"
                     onClick={() => handleVibeTagClick(v.tag)}
-                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#161926] hover:bg-[#1f2335] active:scale-[0.97] border border-[#2b3047] text-zinc-300 hover:text-white text-xs transition-colors cursor-pointer"
+                    className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs transition-all cursor-pointer ${
+                      isSelected
+                        ? 'bg-amber-400/20 border border-amber-400 text-amber-300 font-bold shadow-sm shadow-amber-400/20 scale-[1.02]'
+                        : 'bg-[#161926] hover:bg-[#1f2335] active:scale-[0.97] border border-[#2b3047] text-zinc-300 hover:text-white'
+                    }`}
                   >
-                    <IconComponent className="w-3 h-3 text-amber-400" />
+                    <IconComponent
+                      className={`w-3.5 h-3.5 ${isSelected ? 'text-amber-400' : 'text-zinc-400'}`}
+                    />
                     <span>{v.label}</span>
                   </button>
                 );
@@ -313,20 +414,63 @@ export const GuestRoomPage: React.FC = () => {
               Ваши отправленные заявки ({mySentRequests.length})
             </h3>
             <div className="flex flex-col gap-2">
-              {mySentRequests.map((req) => (
-                <div
-                  key={req.id}
-                  className="p-3.5 rounded-xl bg-[#10121a] border border-[#232738] flex items-center justify-between gap-3 text-xs"
-                >
-                  <div className="flex items-center gap-2.5 truncate">
-                    <Music className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                    <span className="text-zinc-200 font-medium truncate">{req.song_text}</span>
+              {mySentRequests.map((req) => {
+                const isPlayed = req.status === 'played';
+                const isRejected = req.status === 'rejected';
+
+                return (
+                  <div
+                    key={req.id}
+                    className={`p-3.5 rounded-xl border flex items-center justify-between gap-3 text-xs transition-all ${
+                      isPlayed
+                        ? 'bg-emerald-950/20 border-emerald-500/30'
+                        : isRejected
+                          ? 'bg-rose-950/20 border-rose-500/25 opacity-70'
+                          : 'bg-[#10121a] border-[#232738]'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2.5 truncate">
+                      <Music
+                        className={`w-3.5 h-3.5 shrink-0 ${
+                          isPlayed
+                            ? 'text-emerald-400'
+                            : isRejected
+                              ? 'text-rose-400'
+                              : 'text-amber-400'
+                        }`}
+                      />
+                      <span
+                        className={`font-medium truncate ${
+                          isPlayed
+                            ? 'text-emerald-200'
+                            : isRejected
+                              ? 'text-zinc-400 line-through'
+                              : 'text-zinc-200'
+                        }`}
+                      >
+                        {req.song_text}
+                      </span>
+                    </div>
+
+                    {isPlayed ? (
+                      <span className="inline-flex items-center gap-1 text-[10px] font-bold text-emerald-400 bg-emerald-950/80 border border-emerald-500/40 px-2 py-0.5 rounded-full font-mono shrink-0 shadow-sm shadow-emerald-950/40">
+                        <CheckCircle2 className="w-2.5 h-2.5" />
+                        Сыграно ✨
+                      </span>
+                    ) : isRejected ? (
+                      <span className="inline-flex items-center gap-1 text-[10px] font-bold text-rose-400 bg-rose-950/80 border border-rose-500/40 px-2 py-0.5 rounded-full font-mono shrink-0">
+                        <AlertCircle className="w-2.5 h-2.5" />
+                        Отклонено
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1.5 text-[10px] font-medium text-amber-300 bg-amber-950/50 border border-amber-500/30 px-2.5 py-0.5 rounded-full font-mono shrink-0">
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                        В очереди
+                      </span>
+                    )}
                   </div>
-                  <span className="text-[10px] text-zinc-400 bg-[#161926] px-2 py-0.5 rounded font-mono shrink-0">
-                    В очереди
-                  </span>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </section>
         )}

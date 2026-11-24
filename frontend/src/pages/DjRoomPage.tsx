@@ -142,9 +142,8 @@ export const DjRoomPage: React.FC = () => {
         }, 3000);
       };
 
-      ws.onerror = () => {
-        if (isUnmountedRef.current) return;
-        ws.close();
+      ws.onerror = (err) => {
+        console.warn('[WS] WebSocket error in DJ room:', err);
       };
     };
 
