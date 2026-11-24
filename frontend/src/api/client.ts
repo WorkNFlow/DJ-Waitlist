@@ -16,13 +16,25 @@ export class ApiError extends Error {
   }
 }
 
+const RAW_API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim() || '';
+const API_BASE_URL = RAW_API_BASE_URL.replace(/\/+$/, '');
+
+function buildEndpointUrl(endpoint: string): string {
+  if (!API_BASE_URL) {
+    return endpoint;
+  }
+  const cleanEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+  return `${API_BASE_URL}${cleanEndpoint}`;
+}
+
 async function request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers);
   if (options.body && !(options.body instanceof FormData)) {
     headers.set('Content-Type', 'application/json');
   }
 
-  const response = await fetch(endpoint, {
+  const url = buildEndpointUrl(endpoint);
+  const response = await fetch(url, {
     ...options,
     headers,
   });
@@ -108,9 +120,21 @@ export async function updateRequestStatus(
 }
 
 /**
- * Получить правильный WebSocket URL на основе текущего хоста страницы
+ * Получить правильный WebSocket URL на основе текущего хоста страницы или VITE_API_BASE_URL
  */
 export function getWebSocketUrl(code: string): string {
+  const customWsBase = (import.meta.env.VITE_WS_BASE_URL as string | undefined)?.trim();
+  if (customWsBase) {
+    return `${customWsBase.replace(/\/+$/, '')}/ws/${encodeURIComponent(code)}`;
+  }
+
+  if (API_BASE_URL) {
+    const wsBase = API_BASE_URL.replace(/^http(s)?:\/\//i, (_, isHttps) =>
+      isHttps ? 'wss://' : 'ws://',
+    );
+    return `${wsBase}/ws/${encodeURIComponent(code)}`;
+  }
+
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${protocol}//${window.location.host}/ws/${encodeURIComponent(code)}`;
 }
